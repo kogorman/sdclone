@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+# Back up or restore a whole drive
+
+# Last Modified: now
+
+version = "0.1-alpha"
+
+# Usage: cloner.py clone drive name dest
+# Where:
+#    drive is like sda (for /dev/sda)
+#    name is like main-drive
+#    dest is a directory
+#
+# or:
+#        cloner.py read backup drive
+# Where:
+#    drive is like /dev/sda
+#    backup is the directory name like ~/name/when
+
+# TODO: 
+#  add --size-hint to stdmt during compression, based on used space in the partition.
+#  add --commandline, hostname, date, PWD   to the backup record
+#  add -v --version
+
+import sys
+import os
+import argparse
+import json
+from subprocess import run
+from pathlib import Path
+from datetime import datetime
+
+
+def __lsblk__(__dev__, props):
+  '''Capture the output of lsblk for the indicated device,
+     comprising the name, plus the properties listed in the 'props' parameter.'''
+  __path__ = Path(f"/dev/{__dev__}")
+
+  if not __path__.exists() :
+    raise Exception(f"/dev/{__dev__} does not exist")
+
+  return run(f"lsblk --json {__path__} -o name,{props}", shell=True,
+             capture_output=True, check=True)
+
+def mounted(__dev__) :
+  '''Test if the device has any mounted partitions,
+     based on the recorded lsblk(1) output'''
+  __peek__ = __lsblk__(__dev__, "name,mountpoint")
+  __dict__ = json.loads(__peek__.stdout)
+  __num__ = len(__dict__['blockdevices'])
+
+  if __num__ != 1: 
+    raise Exception(f"lsblk says {__path__} comprises {__num__} devices (should be 1)")
+  for child in __dict__['blockdevices'][0]["children"]:
+    if child["mountpoint"] is not None:
+      return True
+  return False
+
+def serial(__dev__):
+  '''Get the serial number of the indicated device, 
+     based on the recorded lsblk(1) output'''
+  __peek__ = __lsblk__(__dev__, "name,serial")
+  __dict__ = json.loads(__peek__.stdout)
+  return __dict__['blockdevices'][0]["serial"]
+
+
+def clone(args):
+  '''Do the clone subcommand'''
+
+  errors=0
+  if args.compress < 1 or args.compress > 19:
+    print ("ERROR: compression must be in the range 1 - 19.")
+    errors += 1
+  if args.verbosity >= 2:
+    print()
+    print("drive is", args.drive)
+    print("name is", args.name)
+    print("dest is", args.dest)
+    print()
+  
+  driverun = run(f"lsblk --json /dev/{args.drive} -o name,pttype,fstype,parttype,mountpoint,serial,uuid",
+                 capture_output=True, shell=True, check=True)
+  jsonbytes = driverun.stdout
+  jsonstr = jsonbytes.decode("utf-8")
+  jsonerrors = driverun.stderr.decode("utf-8")
+  if driverun.returncode != 0:
+    print(f" * * * Error listing /dev/{args.drive}: {jsonerrors}")
+    exit(1)
+  if args.verbosity >= 1:
+    print("json from lsblk is ", jsonstr)
+    print()
+    if jsonerrors == '' :
+       print("No errors")
+    else:
+       print(jsonerrors)
+  
+  try:
+    lsblkout = json.loads(jsonstr)
+  except:
+    print("driverun is", driverun)
+    print("jsonstr is", jsonstr)
+    raise
+  
+  device=lsblkout["blockdevices"][0]
+  if args.verbosity >= 2:
+    print(f"device really is {device['name']}")
+    print(f"   partition table style is {device['pttype']}")
+  children=device["children"]
+
+  # Do not allow the operation if the destination drive has any mounted
+  #   partitions
+  for child in children:
+    if child["mountpoint"] is not None:
+      print(f"    Error: /dev/{child['name']} is mounted on {child['mountpoint']}")
+      errors += 1
+  if errors > 0:
+    print(f"      {errors} errors")
+  
+  # These are names that partclone recognizes.
+  known_types = ["vfat", "exfat", "ntfs", "fat12", "fat16", "fat32", 
+          "ext2", "ext3", "ext4",
+          "btrfs", "reiserfs", "reiser4", "xfs", "ufs", "jfs",
+          "hfs+", "hfsplus",
+          "vmfs", "minix", "f2fs", "nilfs2"];
+  
+  for child in children:
+    cname = child["name"]
+    pname = cname.replace(args.drive,'part',1)
+    parttype = child["parttype"]
+    fstype = child["fstype"]
+    uuid = child["uuid"]
+    
+    # Note: this is intentionally not (yet) an f-string; the {} parens stay.
+    uncompresscmd = "zstdmt --quiet --decompress"
+    compresscmd = f"zstdmt --quiet --compress -{args.compress}"
+  
+    # Delay resolution of two variables until restoring the backup:
+    source = "{source}"
+    dest = "{dest}"
+
+    if parttype == "0x5":
+      # Extended partition.  Let sfdisk take care of it 
+      if args.verbosity >=3: print(f"/dev/{cname} is an extended partition")
+      writer = None
+      reader = None
+    elif parttype is None:
+      # probably pure binary.  could be just a spare, but copy with dd.
+      if args.verbosity >=3: print(f"/dev/{cname} has no assigned type.")
+      writer = "dd bs=1M if=/dev/{cname} | {compresscmd} -o {destmoment}/{pname}.dd.zst" 
+      reader = f'f"zstdmt <{source}/{pname}.dd.zst --quiet --decompress >{dest}"'
+    elif parttype == '21686148-6449-6e6f-744e-656564454649':
+      # GRUB partition.  Copy with dd.
+      if args.verbosity >=3: print(f"/dev/{cname} is a GRUB partition")
+      writer = "dd bs=1M if=/dev/{cname} | {compresscmd} -o {destmoment}/{pname}.dd.zst" 
+      reader = f'f"zstdmt <{source}/{pname}.dd.zst --quiet --decompress >{dest}"'
+    elif fstype == "swap":
+      # Partition type is SWAP; no need to copy, but should mkswap on restore
+      if args.verbosity >=3: print(f"/dev/{cname} is a swap partition.")
+      writer = None
+      reader = 'f"mkswap --uuid={uuid} {dest}"'
+    elif fstype in known_types:
+      # Partition type known to partclone
+      if args.verbosity >=3: print(f"/dev/{cname} is the well-known {fstype}")
+      writer = "partclone.{fstype} --clone --source=/dev/{cname} -o{destmoment}/{pname}.clone.zst --quiet --compresscmd='{compresscmd}' "
+      reader = f'f"zstdmt <{source}/{pname}.clone.zst --quiet --decompress | partclone.{fstype} --restore --quiet --overwrite {dest}"'
+    else:
+      # Unknown
+      print(f"  ERROR: unknown type on /dev/{cname}: {parttype}")
+      errors += 1
+      continue
+    child["writer"] = writer
+    child["reader"] = reader
+    
+  now = datetime.now()
+  nowstr = now.strftime("/%Y%m%d-%H%M%S")
+  destmoment = args.dest + nowstr 
+  print(f"destmoment is {destmoment}")
+  destdir=Path(destmoment)
+  if destdir.exists():
+    print(f"ERROR: {destmoment} already exists")
+    errors += 1
+  else:
+    if errors == 0:
+      os.makedirs(destmoment, exist_ok=True)
+  
+  # If I did this right, at this point either there are no errors, or there is a directory
+  # ready to receive the backup.
+  
+  if errors > 0:
+    print()
+    print(f" NOTE: due to the presence of {errors} error(s), nothing has been done")
+    exit(1)
+  
+  a=1
+  
+  dumprun = run(f"cd {destmoment}; sfdisk --dump  /dev/{args.drive}", capture_output=True, shell=True, check=True)
+  os.makedirs(f"{destmoment}/sfdisk-dump", exist_ok=True)
+  ofile = open(f"{destmoment}/sfdisk-dump/dump-stdout", "wb")
+  ofile.write(dumprun.stdout)
+  ofile.close()
+  ofile = open(f"{destmoment}/sfdisk-dump/dump-stderr", "w")
+  ofile.write(dumprun.stderr.decode("utf-8"))
+  ofile.close()
+  ofile = open(f"{destmoment}/sfdisk-dump/dump-returncode", "w")
+  ofile.write(str(dumprun.returncode))
+  ofile.close()
+  
+  os.makedirs(f"{destmoment}/sfdisk-backup", exist_ok=True)
+  backuprun = run(f"sfdisk --backup  /dev/{args.drive} </dev/null; mv ~/sfdisk-{args.drive}-* {destmoment}/sfdisk-backup",
+                  capture_output=True, shell=True, check=True)
+  ofile = open(f"{destmoment}/sfdisk-backup/backup-stdout", "wb")
+  ofile.write(backuprun.stdout)
+  ofile.close()
+  ofile = open(f"{destmoment}/sfdisk-backup/backup-stderr", "w")
+  ofile.write(backuprun.stderr.decode("utf-8"))
+  ofile.close()
+  ofile = open(f"{destmoment}/sfdisk-backup/backup-returncode", "w")
+  ofile.write(str(backuprun.returncode))
+  ofile.close()
+  
+  ofile = open(f"{destmoment}/lsblk-bytes", "wb")
+  ofile.write(driverun.stdout)
+  ofile.close()
+  ofile = open(f"{destmoment}/lsblk-json", "w")
+  ofile.write(jsonstr)
+  ofile.close()
+  
+  for child in children:
+    cname = child["name"]
+    pname = cname.replace(args.drive, 'part', 1)
+    parttype = child["parttype"]
+    fstype = child["fstype"]
+    if args.verbosity >= 1:
+      print()
+      print("     child", cname)
+      print("    subdir", pname)
+      print("    writer", child["writer"])
+      print("    reader", child["reader"])
+  
+    where=f'{destmoment}/{pname}'
+    try:
+      mkrun = run(f"mkdir -p {where}", capture_output=True, shell=True, check=True)
+      if args.verbosity >= 4:  print(f"  Directory {where} should now exist")
+      if args.verbosity >= 4: print(f"  >>>  Child is {child}")
+    except Exception as e:
+      errors += 1
+      print(f"ERROR in mkdir -p {where}: {e}")
+      continue
+    writer = str(child["writer"])
+    ofile = open(f"{where}/writer","w")
+    ofile.write(writer)
+    ofile.close()
+    if writer is not None and writer != "None":
+      wrote = eval(f'f"{writer}"')
+    else:
+      wrote = "None"
+    ofile = open(f"{where}/wrote","w")
+    ofile.write(wrote)
+    ofile.close()
+    if wrote != "None":
+      wroterun = run(wrote, capture_output=True, shell=True, check=True)
+      ofile = open(f"{where}/wrote-stdout","w")
+      ofile.write(wroterun.stdout.decode("utf-8"))
+      ofile.close
+      ofile = open(f"{where}/wrote-stderr","w")
+      ofile.write(wroterun.stderr.decode("utf-8"))
+      ofile.close
+      ofile = open(f"{where}/wrote-returncode","w")
+      ofile.write(str(wroterun.returncode))
+      ofile.close
+    ofile = open(f"{where}/reader","w")
+    ofile.write(str(child["reader"]))
+    ofile.close()
+  
+  print("Copying the program into the output")
+  run(f"cp $(which {sys.argv[0]}) {destmoment}/",
+      capture_output=True, shell=True, check=True)
+  
+  if errors > 0:
+    print()
+    print(" NOTE: due to errors in creating result directories, processing has stopped early")
+    print("       but some steps have probably already been taken")
+    exit(1)
+
+def read(args):
+  '''Do the read subcommand (i.e. un-clone)'''
+
+  errors = 0
+  if args.verbosity >= 2:
+    print()
+    print("source is", args.source)
+    print("dest is", args.dest)
+    print()
+  
+  dest = args.dest
+  source = args.source
+  if args.verbosity >= 4:
+    print("args =", args)
+
+  driverun = run(f"lsblk --json /dev/{args.dest} -o name,pttype,fstype,parttype,mountpoint,serial,uuid",
+                 capture_output=True, shell=True, check=True)
+  jsonbytes = driverun.stdout
+  jsonstr = jsonbytes.decode("utf-8")
+  jsonerrors = driverun.stderr.decode("utf-8")
+  if driverun.returncode != 0:
+    print(f" * * * Error listing /dev/{args.dest}: {jsonerrors}")
+    exit(1)
+  if args.verbosity >= 1:
+    print("json from lsblk is ", jsonstr)
+    print()
+    if jsonerrors == '' :
+       print("No errors")
+    else:
+       print(jsonerrors)
+  
+  try:
+    lsblkout = json.loads(jsonstr)
+  except:
+    print("driverun is", driverun)
+    print("jsonstr is", jsonstr)
+    raise
+  
+  destserial = lsblkout["blockdevices"][0]["serial"]
+
+  sourcedir = Path(args.source)
+  if not sourcedir.exists():
+    raise Exception(f"Source directory {args.source} does not exist")
+  if args.date is None:
+    tailrun = run(f"ls -1 {args.source} | tail -1",
+                  shell=True, capture_output=True, check=True)
+    thedate=tailrun.stdout.decode("utf-8").split()[0]
+    if thedate == "":
+      errors += 1
+      print("Source directory {args.source} is empty")
+  else:
+    thedate = args.date
+
+  datedir = Path(args.source + "/" + thedate)
+  if not datedir.exists():
+    errors += 1
+    print("Source directory {str(datedir)} does not exist")
+
+  # get json if lsblk from source
+  try:
+    
+    lsblkinrun = run(f"cat {str(datedir)}/lsblk-json",
+                     shell=True, capture_output=True, check=True)
+    lsblkin = json.loads(lsblkinrun.stdout)
+  except:
+    errors += 1
+    print(" * * * ERROR: Source lsblk json is unparseable")
+    raise
+  origserial = lsblkin["blockdevices"][0]["serial"]
+  if args.verbosity >= 2:
+    print(f"Recorded serial number is {origserial}")
+
+  # Require device to be empty OR have the same serial number as the original
+  device=lsblkin["blockdevices"][0]
+  outdevice = lsblkout["blockdevices"][0]
+  if args.verbosity >= 2:
+    print(f"device really is {device['name']}")
+    print(f"   input partition table style is {device['pttype']}")
+    print(f"   input serial number is {device['serial']}")
+    print(f"   output serial number is (and will remain) {outdevice['serial']}")
+    if args.verbosity >= 4:
+      print("lsblock data on block devices:", device)
+  if device["serial"] != lsblkout["blockdevices"][0]["serial"]:
+    if "children" in lsblkout["blockdevices"][0]:
+      errors += 1
+      print(f" * * * ERROR: device /dev/{args.dest} has partitions (and is not the original source)")
+      print()
+      print(f"lsblkin is {lsblkin}")
+      print()
+      print(f"lsblkout is {lsblkout}")
+    
+  if errors > 0:
+    print(f"      {errors} errors")
+    exit(1)
+
+  # Do not allow the operation if the destination drive has any mounted
+  #   partitions
+  if "children" in lsblkout["blockdevices"][0]:
+    children = lsblkout["blockdevices"][0]["children"]
+    for child in children:
+      if child["mountpoint"] is not None:
+        print(f"    Error: /dev/{child['name']} is mounted on {child['mountpoint']}")
+        errors += 1
+
+  if errors > 0:
+    print(f" * * * ERROR: operation cannot proceed because of {errors} error(s).")
+    exit(1)
+  
+  print("LOOKS GOOD -- restoration begins")
+
+  sfdiskinrun = run(f"sfdisk /dev/{args.dest} <{str(datedir)}/sfdisk-dump/dump-stdout",
+                    shell=True, capture_output=True, check=True)
+  if args.verbosity >= 1:
+    print(f"New partition table and partitions set in /dev/{args.dest}")
+    sfdro=sfdiskinrun.stdout.decode("utf-8")
+    if args.verbosity >=3:
+      print(f"  output={sfdro}")
+  
+  children = lsblkin["blockdevices"][0]["children"]
+  drivename = lsblkin["blockdevices"][0]["name"]
+  source = datedir
+
+  print("READERS:")
+  if args.verbosity >= 2:
+    print(f'datedir is {datedir}')
+    print(f'source is {source}')
+
+  for child in children:
+    if args.verbosity >= 3:
+      print(f'child is {child}')
+    name = child["name"]
+    pname = name.replace(drivename,"part")
+    dname = name.replace(drivename,args.dest)
+    if args.verbosity >= 3:
+      print(f'name is {name}')
+      print(f'pname is {pname}')
+      print(f'dname is {dname}')
+
+    reader = f'{datedir}/{pname}/reader'
+    dest = f'/dev/{dname}'
+    uuid = child["uuid"]
+    preaderrun = run(f"cat {reader}",
+                     shell=True, capture_output=True, check=True)
+    sreader1 = preaderrun.stdout.decode("utf-8")
+    reader = eval(sreader1)
+
+    if args.verbosity >=2:
+      print(f"Saved sreader1 is {sreader1}")
+      print(f"Reader is {reader}")
+      print()
+    
+    readerrun = run(reader,
+                    shell=True, capture_output=True, check=True)
+
+  exit(0)
+
+if __name__ == '__main__':
+
+  parser = argparse.ArgumentParser()
+  subparsers = parser.add_subparsers(title='subcommands',
+                                     description='valid subcommands',
+                                     help='additional help',
+                                     required=True)
+  
+  cloner = subparsers.add_parser('clone')
+  reader = subparsers.add_parser('read')
+
+  reader.add_argument("-v","--verbosity", action='count', default=0,
+  	help="increase output verbosity")
+  reader.add_argument("source", help='the directory where the backup(s) of this drive are stored')
+  reader.add_argument("dest", help='the drive where the backup should be restored')
+  reader.add_argument("--date", help='the date of the backup (default is most recent)')
+  reader.set_defaults(func=read)
+  
+  cloner.add_argument("-v","--verbosity", action='count', default=0,
+  	help="increase output verbosity")
+  cloner.add_argument("drive", help="device-name of drive to back up")
+  # Do I really use this?  Prefer to put it in 'dest'
+  #cloner.add_argument("name", help="the name you know the drive by")
+  cloner.add_argument("dest", help="the directory where the backup will go")
+  cloner.add_argument("-c","--compress", type=int, default=3,
+          help="compression level 1-19 default:3")
+  cloner.set_defaults(func=clone)
+  
+  args = parser.parse_args()
+  args.func(args)
+  exit(0)

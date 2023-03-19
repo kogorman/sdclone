@@ -1,26 +1,50 @@
 #!/usr/bin/env python3
 # Back up or restore a whole drive
 
-# Last Modified: now
+# Last Modified: Fri 17 Mar 2023 05:46:50 PM PDT
+# Copyright 2023 Kevin O'Gorman
 
-version = "0.1-alpha"
+#    This file is part of sdclone.
 
-# Usage: cloner.py clone drive name dest
+#    sdclone is free software: you can redistribute it and/or modify it under
+#    the terms of the GNU General Public License as published by the Free
+#    Software Foundation, either version 3 of the License, or (at your option)
+#    any later version.
+
+#    sdclone is distributed in the hope that it will be useful, but WITHOUT ANY
+#    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+#    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+#    details.
+
+#    You should have received a copy of the GNU General Public License along
+#    with sdclone. If not, see <https://www.gnu.org/licenses/>. 
+
+version = "0.1-alpha-4"
+
+# Usage: sdclone clone drive dest
 # Where:
+#    
 #    drive is like sda (for /dev/sda)
-#    name is like main-drive
-#    dest is a directory
+#    dest is a directory where the clone should be saved (in a sub-directory)
 #
-# or:
-#        cloner.py read backup drive
+# Or:    sdclone read  source [ --date=DATE] drive
 # Where:
-#    drive is like /dev/sda
-#    backup is the directory name like ~/name/when
+#    source is a directory where a clone has been saved
+#    drive is like sdb (for /dev/sdb)
+#    DATE is the sub-directory in which the clone was saved (defaults to
+#         the most recent save-date.
 
 # TODO: 
-#  add --size-hint to stdmt during compression, based on used space in the partition.
+#  add --size-hint to zstdmt during compression, based on used space in the partition.
 #  add --commandline, hostname, date, PWD   to the backup record
-#  add -v --version
+#  add -V --version
+#  allow copying FROM a drive with a mounted swap partition (data is not copied anyway).
+#  Determine if --no-sparse can be removed, and what impact that would have.
+#            BEWARE: a filesystem may have pointers to zeroed areas, and expect the
+#            zeroes to be preserved.
+#  Introduce an option like --limit=3 to induce deletion of older backups of the same
+#    series.
+#  Add an option to run fsck on supported filesystems before committing to the clone.
 
 import sys
 import os
@@ -29,7 +53,6 @@ import json
 from subprocess import run
 from pathlib import Path
 from datetime import datetime
-
 
 def __lsblk__(__dev__, props):
   '''Capture the output of lsblk for the indicated device,
@@ -63,7 +86,6 @@ def serial(__dev__):
   __dict__ = json.loads(__peek__.stdout)
   return __dict__['blockdevices'][0]["serial"]
 
-
 def clone(args):
   '''Do the clone subcommand'''
 
@@ -74,12 +96,18 @@ def clone(args):
   if args.verbosity >= 2:
     print()
     print("drive is", args.drive)
-    print("name is", args.name)
     print("dest is", args.dest)
     print()
   
   driverun = run(f"lsblk --json /dev/{args.drive} -o name,pttype,fstype,parttype,mountpoint,serial,uuid",
-                 capture_output=True, shell=True, check=True)
+                 capture_output=True, shell=True)
+  if driverun.returncode != 0:
+    print(f' * * * ERROR: unexpected error code {driverun.returncode} from lsblk')
+    print(f' * * *        stdout: {driverun.stdout}')
+    print(f' * * *        stderr: {driverun.stderr}')
+    print(f' * * * ##########################################')
+    exit(driverun.returncode)
+
   jsonbytes = driverun.stdout
   jsonstr = jsonbytes.decode("utf-8")
   jsonerrors = driverun.stderr.decode("utf-8")
@@ -131,29 +159,16 @@ def clone(args):
     uuid = child["uuid"]
     
     # Note: this is intentionally not (yet) an f-string; the {} parens stay.
-    uncompresscmd = "zstdmt --quiet --decompress"
-    compresscmd = f"zstdmt --quiet --compress -{args.compress}"
-  
-    # Delay resolution of two variables until restoring the backup:
+    uncompresscmd = "zstdmt --quiet --no-sparse --decompress"
+    compresscmd = f"zstdmt --quiet --no-sparse --compress -{args.compress}"
+  # Delay resolution of two variables until restoring the backup:
     source = "{source}"
     dest = "{dest}"
 
-    if parttype == "0x5":
-      # Extended partition.  Let sfdisk take care of it 
-      if args.verbosity >=3: print(f"/dev/{cname} is an extended partition")
-      writer = None
-      reader = None
-    elif parttype is None:
-      # probably pure binary.  could be just a spare, but copy with dd.
-      if args.verbosity >=3: print(f"/dev/{cname} has no assigned type.")
-      writer = "dd bs=1M if=/dev/{cname} | {compresscmd} -o {destmoment}/{pname}.dd.zst" 
-      reader = f'f"zstdmt <{source}/{pname}.dd.zst --quiet --decompress >{dest}"'
-    elif parttype == '21686148-6449-6e6f-744e-656564454649':
-      # GRUB partition.  Copy with dd.
-      if args.verbosity >=3: print(f"/dev/{cname} is a GRUB partition")
-      writer = "dd bs=1M if=/dev/{cname} | {compresscmd} -o {destmoment}/{pname}.dd.zst" 
-      reader = f'f"zstdmt <{source}/{pname}.dd.zst --quiet --decompress >{dest}"'
-    elif fstype == "swap":
+    # First examine filesystem types and operate on that information if possible
+    # You can find the GUID codes on Wikipedia at
+    # https://en.wikipedia.org/wiki/GUID_Partition_Table
+    if fstype == "swap":
       # Partition type is SWAP; no need to copy, but should mkswap on restore
       if args.verbosity >=3: print(f"/dev/{cname} is a swap partition.")
       writer = None
@@ -162,19 +177,50 @@ def clone(args):
       # Partition type known to partclone
       if args.verbosity >=3: print(f"/dev/{cname} is the well-known {fstype}")
       writer = "partclone.{fstype} --clone --source=/dev/{cname} -o{destmoment}/{pname}.clone.zst --quiet --compresscmd='{compresscmd}' "
-      reader = f'f"zstdmt <{source}/{pname}.clone.zst --quiet --decompress | partclone.{fstype} --restore --quiet --overwrite {dest}"'
+      reader = f'f"zstdmt <{source}/{pname}.clone.zst --quiet --no-sparse --decompress | partclone.{fstype} --restore --quiet --overwrite {dest}"'
+    elif parttype is None or parttype == "00000000-0000-0000-0000-000000000000":
+      if args.verbosity >=3: print(f"/dev/{cname} has no assigned type or is unused; ignoring.")
+      # Partition is unused; safely ignore it
+      writer = None
+      reader = None
+    elif parttype == "0x5":
+      # Extended partition.  Let sfdisk take care of it 
+      if args.verbosity >=3: print(f"/dev/{cname} is an extended partition")
+      writer = None
+      reader = None
+    elif parttype == "e3c9e316-0b5c-4db8-817d-f92df00215ae":
+      # Microsoft Reserved Partition; do dd copy
+      writer = "dd bs=1M if=/dev/{cname} | {compresscmd} -o {destmoment}/{pname}.dd.zst" 
+      reader = f'f"zstdmt <{source}/{pname}.dd.zst --quiet --no-sparse --decompress >{dest}"'
+    elif  parttype == "0fc63daf-8483-4772-8e79-3d69d8477de4":
+      # Marked as Linux Filesystem data, but has no filesystem type.  Odd, but it happens.
+      # It could be just a spare, but copy with dd.
+      if args.verbosity >=3: print(f"/dev/{cname} is marked as Linux but has no filesystem type; doing dd copy.")
+      writer = "dd bs=1M if=/dev/{cname} | {compresscmd} -o {destmoment}/{pname}.dd.zst" 
+      reader = f'f"zstdmt <{source}/{pname}.dd.zst --quiet --no-sparse --decompress >{dest}"'
+    elif parttype == '21686148-6449-6e6f-744e-656564454649':
+      # BIOS Boot Partition; sometimes called GRUB partition.  Copy with dd.
+      if args.verbosity >=3: print(f"/dev/{cname} is a GRUB partition")
+      writer = "dd bs=1M if=/dev/{cname} | {compresscmd} -o {destmoment}/{pname}.dd.zst" 
+      reader = f'f"zstdmt <{source}/{pname}.dd.zst --quiet --no-sparse --decompress >{dest}"'
     else:
       # Unknown
-      print(f"  ERROR: unknown type on /dev/{cname}: {parttype}")
-      errors += 1
-      continue
+      print(f"  ERROR: unknown type on /dev/{cname}: Partition {parttype}; Filesystem {fstype}")
+      print(f"         will do dd copy (this can use a lot of time and space; fix if you can")
+      if args.verbosity >=3:
+        print()
+        print(f"         device array is {device}")
+        print()
+      writer = "dd bs=1M if=/dev/{cname} | {compresscmd} -o {destmoment}/{pname}.dd.zst" 
+      reader = f'f"zstdmt <{source}/{pname}.dd.zst --quiet --no-sparse --decompress >{dest}"'
     child["writer"] = writer
     child["reader"] = reader
     
   now = datetime.now()
   nowstr = now.strftime("/%Y%m%d-%H%M%S")
   destmoment = args.dest + nowstr 
-  print(f"destmoment is {destmoment}")
+  if args.verbosity >=1:
+    print(f"destmoment is {destmoment}")
   destdir=Path(destmoment)
   if destdir.exists():
     print(f"ERROR: {destmoment} already exists")
@@ -193,7 +239,14 @@ def clone(args):
   
   a=1
   
-  dumprun = run(f"cd {destmoment}; sfdisk --dump  /dev/{args.drive}", capture_output=True, shell=True, check=True)
+  dumprun = run(f"cd {destmoment}; sfdisk --dump  /dev/{args.drive}", capture_output=True, shell=True)
+  if dumprun.returncode != 0:
+    print(f' * * * ERROR: unexpected error code {dumprun.returncode} from lsblk')
+    print(f' * * *        stdout: {dumprun.stdout}')
+    print(f' * * *        stderr: {dumprun.stderr}')
+    print(f' * * * ##########################################')
+    exit(dumprun.returncode)
+
   os.makedirs(f"{destmoment}/sfdisk-dump", exist_ok=True)
   ofile = open(f"{destmoment}/sfdisk-dump/dump-stdout", "wb")
   ofile.write(dumprun.stdout)
@@ -207,6 +260,8 @@ def clone(args):
   
   os.makedirs(f"{destmoment}/sfdisk-backup", exist_ok=True)
   backuprun = run(f"sfdisk --backup  /dev/{args.drive} </dev/null; mv ~/sfdisk-{args.drive}-* {destmoment}/sfdisk-backup",
+                  capture_output=True, shell=True, check=True)
+  firstmegrun = run(f"dd if=/dev/{args.drive} bs=1M count=1 | {compresscmd} -o {destmoment}/firstmeg.dd.zst",
                   capture_output=True, shell=True, check=True)
   ofile = open(f"{destmoment}/sfdisk-backup/backup-stdout", "wb")
   ofile.write(backuprun.stdout)
@@ -239,12 +294,14 @@ def clone(args):
   
     where=f'{destmoment}/{pname}'
     try:
-      mkrun = run(f"mkdir -p {where}", capture_output=True, shell=True, check=True)
+      runthis1 = f"mkdir -p {where}"
+      if args.verbosity >= 3: print("  dirmaker", runthis1)
+      mkrun = run(runthis1, capture_output=True, shell=True, check=True)
       if args.verbosity >= 4:  print(f"  Directory {where} should now exist")
       if args.verbosity >= 4: print(f"  >>>  Child is {child}")
     except Exception as e:
-      errors += 1
       print(f"ERROR in mkdir -p {where}: {e}")
+      errors += 1
       continue
     writer = str(child["writer"])
     ofile = open(f"{where}/writer","w")
@@ -258,6 +315,8 @@ def clone(args):
     ofile.write(wrote)
     ofile.close()
     if wrote != "None":
+      if args.verbosity >=3:
+        print("   writing", wrote)
       wroterun = run(wrote, capture_output=True, shell=True, check=True)
       ofile = open(f"{where}/wrote-stdout","w")
       ofile.write(wroterun.stdout.decode("utf-8"))
@@ -272,14 +331,15 @@ def clone(args):
     ofile.write(str(child["reader"]))
     ofile.close()
   
-  print("Copying the program into the output")
+  if args.verbosity >= 1:
+    print("Copying the program into the output")
   run(f"cp $(which {sys.argv[0]}) {destmoment}/",
       capture_output=True, shell=True, check=True)
   
   if errors > 0:
     print()
-    print(" NOTE: due to errors in creating result directories, processing has stopped early")
-    print("       but some steps have probably already been taken")
+    print(" NOTE: due to errors in creating result directories or files, processing has stopped early")
+    print("       but some steps have probably already been taken.")
     exit(1)
 
 def read(args):
@@ -367,7 +427,7 @@ def read(args):
   if device["serial"] != lsblkout["blockdevices"][0]["serial"]:
     if "children" in lsblkout["blockdevices"][0]:
       errors += 1
-      print(f" * * * ERROR: device /dev/{args.dest} has partitions (and is not the original source)")
+      print(f" * * * ERROR: device /dev/{args.dest} has partitions (mounted or not) and is not the original source.")
       print()
       print(f"lsblkin is {lsblkin}")
       print()
@@ -390,11 +450,23 @@ def read(args):
     print(f" * * * ERROR: operation cannot proceed because of {errors} error(s).")
     exit(1)
   
-  print("LOOKS GOOD -- restoration begins")
+  if args.verbosity >= 1:
+    print("LOOKS GOOD -- restoration begins")
+
+  # Get the first megabyte copied in before anything else
+  firstmegrun = run(f"zstdmt <{datedir}/firstmeg.dd.zst --quiet --no-sparse --decompress >/dev/{args.dest}",
+                    shell=True, capture_output=True, check=True)
 
   sfdiskinrun = run(f"sfdisk /dev/{args.dest} <{str(datedir)}/sfdisk-dump/dump-stdout",
-                    shell=True, capture_output=True, check=True)
-  if args.verbosity >= 1:
+                    shell=True, capture_output=True)
+  if sfdiskinrun.returncode != 0:
+    print(f' * * * ERROR: unexpected error code {sdfiskinrun.returncode} from sfdisk')
+    print(f' * * *        stdout: {sdfiskinrun.stdout}')
+    print(f' * * *        stderr: {sdfiskinrun.stderr}')
+    print(f' * * * ##########################################')
+    exit(sdfiskinrun.returncode)
+
+  if args.verbosity >= 2:
     print(f"New partition table and partitions set in /dev/{args.dest}")
     sfdro=sfdiskinrun.stdout.decode("utf-8")
     if args.verbosity >=3:
@@ -404,10 +476,11 @@ def read(args):
   drivename = lsblkin["blockdevices"][0]["name"]
   source = datedir
 
-  print("READERS:")
-  if args.verbosity >= 2:
-    print(f'datedir is {datedir}')
-    print(f'source is {source}')
+  if args.verbosity >=1:
+    print("Restoration begins")
+    if args.verbosity >= 2:
+      print(f'datedir is {datedir}')
+      print(f'source is {source}')
 
   for child in children:
     if args.verbosity >= 3:
@@ -421,20 +494,28 @@ def read(args):
       print(f'dname is {dname}')
 
     reader = f'{datedir}/{pname}/reader'
+    if args.verbosity >= 3:
+        print(f"      Reader location is {reader}")
     dest = f'/dev/{dname}'
     uuid = child["uuid"]
     preaderrun = run(f"cat {reader}",
                      shell=True, capture_output=True, check=True)
-    sreader1 = preaderrun.stdout.decode("utf-8")
-    reader = eval(sreader1)
+    savedreader = preaderrun.stdout.decode("utf-8")
+    reader = eval(savedreader)
 
-    if args.verbosity >=2:
-      print(f"Saved sreader1 is {sreader1}")
-      print(f"Reader is {reader}")
-      print()
+    if args.verbosity >= 2:
+      if args.verbosity >= 3:
+        print(f"         Saved reader is {savedreader}")
+      print(f"  Instantiated reader is {reader}")
     
-    readerrun = run(reader,
-                    shell=True, capture_output=True, check=True)
+    if savedreader == "None":
+      if args.verbosity >= 2:
+        print(f"  Reading skipped")
+    else:
+      readerrun = run(reader,
+                      shell=True, capture_output=True, check=True)
+    if args.verbosity >= 2:
+      print()
 
   exit(0)
 
